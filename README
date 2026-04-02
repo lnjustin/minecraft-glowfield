@@ -1,0 +1,109 @@
+🌟 GlowField
+
+GlowField is a server-side Fabric mod that creates dynamic, configurable force-field zones using Respawn Anchors. These zones protect areas by preventing mob spawns, damaging hostile entities, and rendering a visible particle-based barrier—all without requiring any client-side mods.
+
+⸻
+
+⚡ Features
+
+🛡️ Force Field Zones
+	•	Create protected areas using 4 Respawn Anchors
+	•	Forms a rectangular 3D zone from world bottom to top
+	•	Fully server-side — vanilla clients can join without installing anything
+
+⸻
+
+🔋 Charge-Based Behavior
+
+Zones automatically change behavior based on anchor charge levels:
+	•	All anchors fully charged (4 charges)
+→ Force Field Mode
+	•	Damages mobs that enter
+	•	Strong visual particle barrier
+	•	All anchors have ≥1 charge
+→ Spawn Prevention Mode
+	•	Prevents hostile mob spawning
+	•	Softer visual effect
+	•	Any anchor uncharged
+→ Inactive
+	•	Zone does nothing
+
+⸻
+
+⚠️ Degradation System
+
+Force fields are not infinite:
+	•	Every N mobs prevented or damaged (configurable)
+→ reduces anchor charge by 1
+	•	Encourages maintenance and recharging
+
+⸻
+
+✨ Particle Force Field
+	•	Full 3D perimeter rendering
+	•	Configurable particle types per state:
+	•	Force Field → e.g. portal
+	•	Spawn Prevention → e.g. smoke
+	•	Inactive → e.g. end rod
+	•	Rendered server-side via packets
+
+⸻
+
+🧠 Smart Performance Design
+	•	Chunk-indexed zones (no global scanning)
+	•	Event-driven updates (no ticking loops)
+	•	Efficient entity queries via bounding boxes
+	•	Scales to many zones without lag
+
+⸻
+
+💾 Persistent Zones
+	•	Zones are saved to disk (NBT)
+	•	Automatically restored on server restart
+	•	Includes:
+	•	Anchor positions
+	•	Owner
+	•	Zone name
+
+⸻
+
+👤 Ownership & Naming
+	•	Zones track the player who created them
+		•	(Optional) Support for naming via Name Tags
+
+    ⸻
+
+    📦 Installation
+
+    Requirements
+    	•	Minecraft 1.21.x (Fabric)
+    	•	Fabric Loader 0.16+
+    	•	Fabric API
+
+    Steps
+    	1.	Install Fabric Loader
+    	2.	Install Fabric API
+    	3.	Drop the GlowField .jar into your /mods folder
+    	4.	Start the server
+
+    ⸻
+
+    ⚙️ Configuration
+
+    Config file is generated at: /config/glowfield.json
+
+    Options
+    	•	enableParticles — toggle rendering
+    	•	suppressionThreshold — mobs required to degrade field
+    	•	forceFieldDamage — damage dealt to mobs
+    	•	forceFieldParticle — particle for full field
+    	•	spawnPreventionParticle — particle for weak field
+    	•	inactiveParticle — fallback particle
+
+    ⸻
+
+    🧱 How to Use
+    	1.	Place 4 Respawn Anchors in a rectangle (corners)
+    	2.	Charge them using Glowstone
+    	3.	Ensure all anchors meet charge requirements
+    	4.	Zone activates automatically
