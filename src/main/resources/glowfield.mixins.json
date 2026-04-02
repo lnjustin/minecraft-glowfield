@@ -1,0 +1,15 @@
+{
+	"required": true,
+	"package": "lnjustin.glowfield.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"mixins": [
+		"RespawnAnchorBlockMixin",
+		"ServerWorldMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
