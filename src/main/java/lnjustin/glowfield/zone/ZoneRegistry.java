@@ -22,6 +22,7 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.Heightmap;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
 import org.jetbrains.annotations.Nullable;
@@ -305,7 +306,7 @@ public final class ZoneRegistry {
 				continue;
 			}
 
-			for (Entity entity : world.getOtherEntities(null, zone.bounds().expand(1.0), checked -> !checked.isSpectator())) {
+			for (Entity entity : world.getOtherEntities(null, zone.runtimeBounds(world).expand(1.0), checked -> !checked.isSpectator())) {
 				if (!zone.contains(entity.getBlockPos())) {
 					continue;
 				}
@@ -317,9 +318,9 @@ public final class ZoneRegistry {
 	private void applyZoneEffects(ServerWorld world, GlowZone zone, ZoneState state, Entity entity) {
 		if (entity instanceof MobEntity mob) {
 			if (config.damageMobs && state == ZoneState.FORCE_FIELD) {
-				boolean lethal = mob.getHealth() <= config.forceFieldDamage;
-				mob.damage(world, world.getDamageSources().magic(), (float) config.forceFieldDamage);
-				if (lethal) {
+				boolean wasAlive = mob.isAlive();
+				mob.damage(world, world.getDamageSources().magic(), Float.MAX_VALUE);
+				if (wasAlive && !mob.isAlive()) {
 					recordZoneInteraction(world, zone, 1);
 				}
 			}
@@ -345,24 +346,58 @@ public final class ZoneRegistry {
 	}
 
 	private void renderZoneParticles(ServerWorld world, GlowZone zone, ZoneState state) {
+		if (!shouldRenderParticlesForState(state)) {
+			return;
+		}
+
 		ParticleEffect particle = config.particleFor(state);
-		Box bounds = zone.bounds();
+		Box bounds = zone.particleBounds(config);
 		double step = Math.max(0.5, config.particleStep);
 
-		for (double x = bounds.minX; x <= bounds.maxX; x += step) {
-			spawnColumn(world, particle, x, bounds.minY, bounds.maxY, bounds.minZ);
-			spawnColumn(world, particle, x, bounds.minY, bounds.maxY, bounds.maxZ);
-		}
-		for (double z = bounds.minZ; z <= bounds.maxZ; z += step) {
-			spawnColumn(world, particle, bounds.minX, bounds.minY, bounds.maxY, z);
-			spawnColumn(world, particle, bounds.maxX, bounds.minY, bounds.maxY, z);
-		}
-		for (double x = bounds.minX; x <= bounds.maxX; x += step) {
+		if (config.renderVerticalParticleEdges) {
+			for (double x = bounds.minX; x <= bounds.maxX; x += step) {
+				spawnColumn(world, particle, x, particleColumnMinY(world, bounds, x, bounds.minZ), bounds.maxY, bounds.minZ);
+				spawnColumn(world, particle, x, particleColumnMinY(world, bounds, x, bounds.maxZ), bounds.maxY, bounds.maxZ);
+			}
 			for (double z = bounds.minZ; z <= bounds.maxZ; z += step) {
-				world.spawnParticles(particle, x + 0.5, bounds.minY + 0.5, z + 0.5, 1, 0, 0, 0, 0);
-				world.spawnParticles(particle, x + 0.5, bounds.maxY + 0.5, z + 0.5, 1, 0, 0, 0, 0);
+				spawnColumn(world, particle, bounds.minX, particleColumnMinY(world, bounds, bounds.minX, z), bounds.maxY, z);
+				spawnColumn(world, particle, bounds.maxX, particleColumnMinY(world, bounds, bounds.maxX, z), bounds.maxY, z);
 			}
 		}
+
+		if (config.renderBottomParticleFace || config.renderTopParticleFace) {
+			for (double x = bounds.minX; x <= bounds.maxX; x += step) {
+				for (double z = bounds.minZ; z <= bounds.maxZ; z += step) {
+					if (config.renderBottomParticleFace) {
+						world.spawnParticles(particle, x + 0.5, bounds.minY + 0.5, z + 0.5, 1, 0, 0, 0, 0);
+					}
+					if (config.renderTopParticleFace) {
+						world.spawnParticles(particle, x + 0.5, bounds.maxY + 0.5, z + 0.5, 1, 0, 0, 0, 0);
+					}
+				}
+			}
+		}
+	}
+
+	private boolean shouldRenderParticlesForState(ZoneState state) {
+		return switch (state) {
+			case INACTIVE -> false;
+			case PARTIAL -> config.renderParticlesForPartialState;
+			case FORCE_FIELD -> config.renderParticlesForForceFieldState;
+			case DEGRADING -> config.renderParticlesForDegradingState;
+		};
+	}
+
+	private double particleColumnMinY(ServerWorld world, Box bounds, double x, double z) {
+		if (!config.renderParticlesDownToGround) {
+			return bounds.minY;
+		}
+
+		int blockX = BlockPos.ofFloored(x, bounds.minY, z).getX();
+		int blockZ = BlockPos.ofFloored(x, bounds.minY, z).getZ();
+		int topOpenY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, blockX, blockZ);
+		int groundY = Math.max(world.getBottomY(), topOpenY - 1);
+		return Math.min(bounds.minY, groundY);
 	}
 
 	private void spawnColumn(ServerWorld world, ParticleEffect particle, double x, double minY, double maxY, double z) {
@@ -375,6 +410,7 @@ public final class ZoneRegistry {
 	private void registerZone(GlowZone zone) {
 		zones.put(zone.id(), zone);
 		zoneSignatures.put(ZoneSignature.of(zone.worldKey(), zone.anchors()), zone.id());
+		loadedZoneIds.computeIfAbsent(zone.worldKey(), key -> new HashSet<>()).add(zone.id());
 
 		for (BlockPos anchor : zone.anchors()) {
 			addAnchor(zone.worldKey(), anchor);
@@ -461,12 +497,12 @@ public final class ZoneRegistry {
 
 		for (int x = 0; x < 16; x++) {
 			for (int z = 0; z < 16; z++) {
-				for (int y = bottomY; y <= topY; y++) {
-					BlockPos pos = new BlockPos(startX + x, y, startZ + z);
-					if (world.getBlockState(pos).isOf(Blocks.RESPAWN_ANCHOR)) {
-						addAnchor(world.getRegistryKey(), pos);
+					for (int y = bottomY; y <= topY; y++) {
+						BlockPos pos = new BlockPos(startX + x, y, startZ + z);
+						if (chunk.getBlockState(pos).isOf(Blocks.RESPAWN_ANCHOR)) {
+							addAnchor(world.getRegistryKey(), pos);
+						}
 					}
-				}
 			}
 		}
 	}
@@ -521,7 +557,7 @@ public final class ZoneRegistry {
 
 		for (UUID zoneId : candidates) {
 			GlowZone zone = zones.get(zoneId);
-			if (zone != null && zone.contains(box)) {
+			if (zone != null && zone.contains(world, box)) {
 				return zone;
 			}
 		}

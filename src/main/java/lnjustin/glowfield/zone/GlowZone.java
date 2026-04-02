@@ -81,6 +81,15 @@ public final class GlowZone {
 		return bounds;
 	}
 
+	public Box runtimeBounds(ServerWorld world) {
+		return new Box(bounds.minX, world.getBottomY(), bounds.minZ, bounds.maxX, world.getTopYInclusive(), bounds.maxZ);
+	}
+
+	public Box particleBounds(GlowFieldConfig config) {
+		double maxY = bounds.minY + Math.max(0, config.particleRenderHeightBlocks - 1);
+		return new Box(bounds.minX, bounds.minY, bounds.minZ, bounds.maxX, maxY, bounds.maxZ);
+	}
+
 	public Set<ChunkPos> coveredChunks() {
 		return Set.copyOf(coveredChunks);
 	}
@@ -117,14 +126,14 @@ public final class GlowZone {
 
 	public boolean contains(BlockPos pos) {
 		return pos.getX() >= bounds.minX && pos.getX() <= bounds.maxX
-			&& pos.getY() >= bounds.minY && pos.getY() <= bounds.maxY
 			&& pos.getZ() >= bounds.minZ && pos.getZ() <= bounds.maxZ;
 	}
 
-	public boolean contains(Box box) {
-		return box.minX >= bounds.minX && box.maxX <= bounds.maxX + 1.0
-			&& box.minY >= bounds.minY && box.maxY <= bounds.maxY + 1.0
-			&& box.minZ >= bounds.minZ && box.maxZ <= bounds.maxZ + 1.0;
+	public boolean contains(ServerWorld world, Box box) {
+		Box runtimeBounds = runtimeBounds(world);
+		return box.minX >= runtimeBounds.minX && box.maxX <= runtimeBounds.maxX + 1.0
+			&& box.minY >= runtimeBounds.minY && box.maxY <= runtimeBounds.maxY + 1.0
+			&& box.minZ >= runtimeBounds.minZ && box.maxZ <= runtimeBounds.maxZ + 1.0;
 	}
 
 	public boolean recordInteractionAndShouldDegrade(int interactionCount, GlowFieldConfig config) {

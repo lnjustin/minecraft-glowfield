@@ -26,6 +26,13 @@ public final class GlowFieldConfig {
 	public boolean damageMobs = true;
 	public boolean nameTagNamingEnabled = true;
 	public boolean persistCachedBounds = true;
+	public boolean renderVerticalParticleEdges = true;
+	public boolean renderTopParticleFace = true;
+	public boolean renderBottomParticleFace = false;
+	public boolean renderParticlesDownToGround = true;
+	public boolean renderParticlesForPartialState = true;
+	public boolean renderParticlesForForceFieldState = true;
+	public boolean renderParticlesForDegradingState = true;
 
 	public int forceFieldMinCharge = 4;
 	public int partialMinCharge = 1;
@@ -34,9 +41,10 @@ public final class GlowFieldConfig {
 	public int particleIntervalTicks = 20;
 	public int entitySweepIntervalTicks = 10;
 	public int saveFlushIntervalTicks = 200;
+	public int particleRenderHeightBlocks = 1;
 
 	public double forceFieldDamage = 4.0;
-	public double particleStep = 1.5;
+	public double particleStep = 3.0;
 	public double particleViewPadding = 32.0;
 
 	public Map<String, String> stateParticles = defaultParticles();
@@ -59,6 +67,7 @@ public final class GlowFieldConfig {
 					config.stateParticles = defaultParticles();
 				}
 
+				save(config);
 				return config;
 			}
 		} catch (Exception exception) {

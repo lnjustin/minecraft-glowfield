@@ -18,14 +18,14 @@ public abstract class ServerWorldMixin {
 	@Unique
 	private final ThreadLocal<ArrayDeque<BlockSnapshot>> glowfield$pendingSnapshots = ThreadLocal.withInitial(ArrayDeque::new);
 
-	@Inject(method = "setBlockState", at = @At("HEAD"))
-	private void glowfield$captureBefore(BlockPos pos, BlockState state, int flags, int maxUpdateDepth, CallbackInfoReturnable<Boolean> cir) {
+	@Inject(method = "setBlockState(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/BlockState;I)Z", at = @At("HEAD"))
+	private void glowfield$captureBefore(BlockPos pos, BlockState state, int flags, CallbackInfoReturnable<Boolean> cir) {
 		World world = (World) (Object) this;
 		glowfield$pendingSnapshots.get().push(new BlockSnapshot(pos.toImmutable(), world.getBlockState(pos)));
 	}
 
-	@Inject(method = "setBlockState", at = @At("RETURN"))
-	private void glowfield$emitAfter(BlockPos pos, BlockState state, int flags, int maxUpdateDepth, CallbackInfoReturnable<Boolean> cir) {
+	@Inject(method = "setBlockState(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/BlockState;I)Z", at = @At("RETURN"))
+	private void glowfield$emitAfter(BlockPos pos, BlockState state, int flags, CallbackInfoReturnable<Boolean> cir) {
 		World world = (World) (Object) this;
 		BlockSnapshot snapshot = glowfield$pendingSnapshots.get().pop();
 		if (cir.getReturnValueZ() && world instanceof ServerWorld serverWorld) {
