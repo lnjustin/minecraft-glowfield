@@ -17,8 +17,10 @@ import net.minecraft.world.World;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -29,20 +31,49 @@ public final class GlowZone {
 	private String ownerName;
 	private String name;
 	private final LinkedHashSet<BlockPos> anchors;
+	private final LinkedHashMap<UUID, String> members;
 	private final Box bounds;
 	private final Set<ChunkPos> coveredChunks;
 	private int interactionProgress;
+	private boolean hostileToNonMembers;
+	private long remainingActiveTicks;
+	private long lastUpdatedTick;
+	private int hostilePlayerDeathsRemaining;
+	private String lastAnnouncedMode;
 
 	public GlowZone(UUID id, RegistryKey<World> worldKey, UUID ownerUuid, String ownerName, String name, Collection<BlockPos> anchors, int interactionProgress) {
+		this(id, worldKey, ownerUuid, ownerName, name, anchors, interactionProgress, Map.of(), false, 0, -1, 0);
+	}
+
+	public GlowZone(
+		UUID id,
+		RegistryKey<World> worldKey,
+		UUID ownerUuid,
+		String ownerName,
+		String name,
+		Collection<BlockPos> anchors,
+		int interactionProgress,
+		Map<UUID, String> members,
+		boolean hostileToNonMembers,
+		long remainingActiveTicks,
+		long lastUpdatedTick,
+		int hostilePlayerDeathsRemaining
+	) {
 		this.id = id;
 		this.worldKey = worldKey;
 		this.ownerUuid = ownerUuid;
 		this.ownerName = ownerName;
 		this.name = name == null ? "" : name;
 		this.anchors = new LinkedHashSet<>(anchors);
+		this.members = new LinkedHashMap<>(members);
 		this.bounds = computeBounds(this.anchors);
 		this.coveredChunks = computeChunks(bounds);
 		this.interactionProgress = Math.max(0, interactionProgress);
+		this.hostileToNonMembers = hostileToNonMembers;
+		this.remainingActiveTicks = Math.max(0, remainingActiveTicks);
+		this.lastUpdatedTick = lastUpdatedTick;
+		this.hostilePlayerDeathsRemaining = Math.max(0, hostilePlayerDeathsRemaining);
+		this.lastAnnouncedMode = null;
 	}
 
 	public UUID id() {
@@ -77,6 +108,10 @@ public final class GlowZone {
 		return Set.copyOf(anchors);
 	}
 
+	public Map<UUID, String> members() {
+		return Map.copyOf(members);
+	}
+
 	public Box bounds() {
 		return bounds;
 	}
@@ -98,6 +133,59 @@ public final class GlowZone {
 		return interactionProgress;
 	}
 
+	public boolean isMember(UUID uuid) {
+		return ownerUuid.equals(uuid) || members.containsKey(uuid);
+	}
+
+	public boolean hostileToNonMembers() {
+		return hostileToNonMembers;
+	}
+
+	public long remainingActiveTicks() {
+		return remainingActiveTicks;
+	}
+
+	public int hostilePlayerDeathsRemaining() {
+		return hostilePlayerDeathsRemaining;
+	}
+
+	public String currentModeKey(ServerWorld world, GlowFieldConfig config) {
+		ZoneState state = state(world, config);
+		if (state == ZoneState.FORCE_FIELD && isHostileProtectionActive(world, config)) {
+			return "hostile_force_field";
+		}
+		return state.serializedName();
+	}
+
+	public String currentModeLabel(ServerWorld world, GlowFieldConfig config) {
+		return switch (currentModeKey(world, config)) {
+			case "partial" -> "Spawn Prevention Mode";
+			case "force_field" -> "Force Field Mode";
+			case "degrading" -> "Degrading Mode";
+			case "hostile_force_field" -> "Hostile Force Field Mode";
+			default -> "Inactive Mode";
+		};
+	}
+
+	public boolean markModeAnnounced(String modeKey) {
+		if (modeKey.equals(lastAnnouncedMode)) {
+			return false;
+		}
+		lastAnnouncedMode = modeKey;
+		return true;
+	}
+
+	public void addMember(UUID uuid, String name) {
+		if (ownerUuid.equals(uuid)) {
+			return;
+		}
+		members.put(uuid, name == null ? "" : name);
+	}
+
+	public void removeMember(UUID uuid) {
+		members.remove(uuid);
+	}
+
 	public int minAnchorCharge(ServerWorld world) {
 		int minCharge = Integer.MAX_VALUE;
 		for (BlockPos anchor : anchors) {
@@ -111,8 +199,12 @@ public final class GlowZone {
 	}
 
 	public ZoneState state(ServerWorld world, GlowFieldConfig config) {
+		syncRuntime(world, config);
 		int minCharge = minAnchorCharge(world);
-		if (minCharge < config.partialMinCharge) {
+		if (minCharge < config.partialMinCharge || remainingActiveTicks <= 0) {
+			return ZoneState.INACTIVE;
+		}
+		if (hostileToNonMembers && hostilePlayerDeathsRemaining <= 0) {
 			return ZoneState.INACTIVE;
 		}
 		if (interactionProgress >= config.degradingStateThreshold && minCharge > 0) {
@@ -149,6 +241,79 @@ public final class GlowZone {
 		interactionProgress = 0;
 	}
 
+	public void syncRuntime(ServerWorld world, GlowFieldConfig config) {
+		long currentTick = world.getTime();
+		if (lastUpdatedTick < 0) {
+			lastUpdatedTick = currentTick;
+			if (remainingActiveTicks <= 0) {
+				remainingActiveTicks = maxDurationTicks(world, config);
+			}
+			if (hostileToNonMembers && hostilePlayerDeathsRemaining <= 0) {
+				hostilePlayerDeathsRemaining = Math.max(0, config.hostileFieldPlayerDeathLimit);
+			}
+			return;
+		}
+
+		long elapsed = Math.max(0, currentTick - lastUpdatedTick);
+		lastUpdatedTick = currentTick;
+		if (elapsed <= 0 || remainingActiveTicks <= 0 || minAnchorCharge(world) < config.partialMinCharge) {
+			return;
+		}
+
+		remainingActiveTicks = Math.max(0, remainingActiveTicks - elapsed);
+	}
+
+	public void resetForCurrentCharge(ServerWorld world, GlowFieldConfig config) {
+		hostileToNonMembers = false;
+		interactionProgress = 0;
+		remainingActiveTicks = maxDurationTicks(world, config);
+		lastUpdatedTick = world.getTime();
+		hostilePlayerDeathsRemaining = 0;
+	}
+
+	public void armAgainstNonMembers(ServerWorld world, GlowFieldConfig config) {
+		hostileToNonMembers = true;
+		interactionProgress = 0;
+		remainingActiveTicks = maxDurationTicks(world, config);
+		lastUpdatedTick = world.getTime();
+		hostilePlayerDeathsRemaining = Math.max(0, config.hostileFieldPlayerDeathLimit);
+	}
+
+	public boolean consumesPlayerDeath(ServerWorld world, GlowFieldConfig config) {
+		syncRuntime(world, config);
+		if (!hostileToNonMembers || hostilePlayerDeathsRemaining <= 0) {
+			return false;
+		}
+
+		hostilePlayerDeathsRemaining--;
+		if (hostilePlayerDeathsRemaining <= 0) {
+			remainingActiveTicks = 0;
+		}
+		return true;
+	}
+
+	public boolean isHostileProtectionActive(ServerWorld world, GlowFieldConfig config) {
+		if (!config.allowNonMemberPlayerDamage) {
+			return false;
+		}
+
+		return hostileToNonMembers && state(world, config) == ZoneState.FORCE_FIELD;
+	}
+
+	private long maxDurationTicks(ServerWorld world, GlowFieldConfig config) {
+		int minCharge = minAnchorCharge(world);
+		if (minCharge < config.partialMinCharge) {
+			return 0;
+		}
+		if (hostileToNonMembers && minCharge >= config.forceFieldMinCharge) {
+			return Math.max(0, config.hostileForceFieldDurationTicks);
+		}
+		if (minCharge >= config.forceFieldMinCharge) {
+			return Math.max(0, config.forceFieldDurationTicks);
+		}
+		return Math.max(0, config.partialFieldDurationTicks);
+	}
+
 	public void writeNbt(NbtCompound tag) {
 		tag.putString("id", id.toString());
 		tag.putString("world", worldKey.getValue().toString());
@@ -156,6 +321,10 @@ public final class GlowZone {
 		tag.putString("owner_name", ownerName == null ? "" : ownerName);
 		tag.putString("name", name == null ? "" : name);
 		tag.putInt("interaction_progress", interactionProgress);
+		tag.putBoolean("hostile_to_non_members", hostileToNonMembers);
+		tag.putLong("remaining_active_ticks", remainingActiveTicks);
+		tag.putLong("last_updated_tick", lastUpdatedTick);
+		tag.putInt("hostile_player_deaths_remaining", hostilePlayerDeathsRemaining);
 
 		NbtList anchorList = new NbtList();
 		for (BlockPos anchor : sortedAnchors(anchors)) {
@@ -166,6 +335,15 @@ public final class GlowZone {
 			anchorList.add(anchorTag);
 		}
 		tag.put("anchors", anchorList);
+
+		NbtList memberList = new NbtList();
+		for (Map.Entry<UUID, String> entry : members.entrySet()) {
+			NbtCompound memberTag = new NbtCompound();
+			memberTag.putString("uuid", entry.getKey().toString());
+			memberTag.putString("name", entry.getValue() == null ? "" : entry.getValue());
+			memberList.add(memberTag);
+		}
+		tag.put("members", memberList);
 
 		NbtCompound boundsTag = new NbtCompound();
 		boundsTag.putInt("min_x", (int) bounds.minX);
@@ -185,6 +363,17 @@ public final class GlowZone {
 			anchors.add(new BlockPos(anchorTag.getInt("x", 0), anchorTag.getInt("y", 0), anchorTag.getInt("z", 0)));
 		}
 
+		Map<UUID, String> members = new LinkedHashMap<>();
+		NbtList memberList = tag.getListOrEmpty("members");
+		for (int i = 0; i < memberList.size(); i++) {
+			NbtCompound memberTag = memberList.getCompoundOrEmpty(i);
+			String uuid = memberTag.getString("uuid", "");
+			try {
+				members.put(UUID.fromString(uuid), memberTag.getString("name", ""));
+			} catch (IllegalArgumentException ignored) {
+			}
+		}
+
 		return new GlowZone(
 			UUID.fromString(tag.getString("id", UUID.randomUUID().toString())),
 			RegistryKey.of(RegistryKeys.WORLD, Identifier.of(tag.getString("world", "minecraft:overworld"))),
@@ -192,7 +381,12 @@ public final class GlowZone {
 			tag.getString("owner_name", ""),
 			tag.getString("name", ""),
 			anchors,
-			tag.getInt("interaction_progress", 0)
+			tag.getInt("interaction_progress", 0),
+			members,
+			tag.getBoolean("hostile_to_non_members", false),
+			tag.getLong("remaining_active_ticks", 0),
+			tag.getLong("last_updated_tick", -1),
+			tag.getInt("hostile_player_deaths_remaining", 0)
 		);
 	}
 

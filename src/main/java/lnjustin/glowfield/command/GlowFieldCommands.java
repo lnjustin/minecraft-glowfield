@@ -4,6 +4,7 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import lnjustin.glowfield.zone.GlowZone;
 import lnjustin.glowfield.zone.ZoneRegistry;
+import net.minecraft.command.argument.EntityArgumentType;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -70,6 +71,61 @@ public final class GlowFieldCommands {
 					registry.removeZone(zone.id());
 					context.getSource().sendFeedback(() -> Text.literal("Removed " + registry.describeZone(zone.id()) + "."), true);
 					return 1;
-				})));
+				}))
+			.then(CommandManager.literal("member")
+				.then(CommandManager.literal("add")
+					.then(CommandManager.argument("player", EntityArgumentType.player())
+						.executes(context -> {
+							ServerPlayerEntity owner = context.getSource().getPlayerOrThrow();
+							GlowZone zone = registry.findOwnedZoneContaining(owner);
+							if (zone == null) {
+								context.getSource().sendError(Text.literal("You are not inside one of your GlowField zones."));
+								return 0;
+							}
+
+							ServerPlayerEntity member = EntityArgumentType.getPlayer(context, "player");
+							if (registry.addMember(zone.id(), member)) {
+								context.getSource().sendFeedback(() -> Text.literal("Added " + member.getName().getString() + " to " + registry.describeZone(zone.id()) + "."), false);
+								return 1;
+							}
+
+							context.getSource().sendError(Text.literal("Could not add that player to the zone."));
+							return 0;
+						})))
+				.then(CommandManager.literal("remove")
+					.then(CommandManager.argument("player", EntityArgumentType.player())
+						.executes(context -> {
+							ServerPlayerEntity owner = context.getSource().getPlayerOrThrow();
+							GlowZone zone = registry.findOwnedZoneContaining(owner);
+							if (zone == null) {
+								context.getSource().sendError(Text.literal("You are not inside one of your GlowField zones."));
+								return 0;
+							}
+
+							ServerPlayerEntity member = EntityArgumentType.getPlayer(context, "player");
+							if (registry.removeMember(zone.id(), member.getUuid())) {
+								context.getSource().sendFeedback(() -> Text.literal("Removed " + member.getName().getString() + " from " + registry.describeZone(zone.id()) + "."), false);
+								return 1;
+							}
+
+							context.getSource().sendError(Text.literal("That player is not a member of the zone."));
+							return 0;
+						})))
+				.then(CommandManager.literal("list")
+					.executes(context -> {
+						ServerPlayerEntity owner = context.getSource().getPlayerOrThrow();
+						GlowZone zone = registry.findOwnedZoneContaining(owner);
+						if (zone == null) {
+							context.getSource().sendError(Text.literal("You are not inside one of your GlowField zones."));
+							return 0;
+						}
+						if (zone.members().isEmpty()) {
+							context.getSource().sendFeedback(() -> Text.literal(registry.describeZone(zone.id()) + " has no members."), false);
+							return 0;
+						}
+
+						context.getSource().sendFeedback(() -> Text.literal("Members: " + String.join(", ", zone.members().values())), false);
+						return zone.members().size();
+					}))));
 	}
 }

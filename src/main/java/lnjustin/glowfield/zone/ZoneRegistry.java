@@ -7,6 +7,8 @@ import net.minecraft.block.RespawnAnchorBlock;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.damage.DamageSource;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -27,7 +29,6 @@ import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
 import org.jetbrains.annotations.Nullable;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -49,6 +50,10 @@ public final class ZoneRegistry {
 	private final Map<RegistryKey<World>, Set<UUID>> loadedZoneIds = new HashMap<>();
 	private final Map<ZoneSignature, UUID> zoneSignatures = new HashMap<>();
 	private final Map<PendingPlacementKey, PlacementClaim> pendingPlacements = new HashMap<>();
+	private final Map<PendingHostileActivationKey, Set<BlockPos>> pendingHostileActivations = new HashMap<>();
+	private final Map<UUID, ZoneDamageRecord> recentPlayerZoneDamage = new HashMap<>();
+	private final Map<AnchorDamageKey, AnchorDamageProgress> anchorDamage = new HashMap<>();
+	private final Map<UUID, Long> lastHostileDamageTicks = new HashMap<>();
 	private MinecraftServer server;
 	private boolean dirty;
 
@@ -70,6 +75,7 @@ public final class ZoneRegistry {
 	}
 
 	public void save(MinecraftServer server) {
+		syncZonesForSave(server);
 		if (!dirty) {
 			return;
 		}
@@ -90,6 +96,19 @@ public final class ZoneRegistry {
 	}
 
 	public void onEndWorldTick(ServerWorld world) {
+		boolean changed = false;
+		for (GlowZone zone : loadedZones(world)) {
+			long before = zone.remainingActiveTicks();
+			zone.syncRuntime(world, config);
+			maybeNotifyZoneMode(world, zone);
+			if (zone.remainingActiveTicks() != before) {
+				changed = true;
+			}
+		}
+		if (changed) {
+			dirty = true;
+		}
+
 		long time = world.getTime();
 		if (config.particlesEnabled && time % config.particleIntervalTicks == 0) {
 			renderWorldParticles(world);
@@ -117,6 +136,31 @@ public final class ZoneRegistry {
 		findFirstZoneContaining((ServerWorld) player.getEntityWorld(), player.getBoundingBox());
 	}
 
+	public void onEntityDeath(LivingEntity entity, DamageSource source) {
+		if (!(entity instanceof ServerPlayerEntity player)) {
+			return;
+		}
+
+		ZoneDamageRecord record = recentPlayerZoneDamage.remove(player.getUuid());
+		if (record == null) {
+			return;
+		}
+
+		ServerWorld world = (ServerWorld) player.getEntityWorld();
+		if (world.getTime() - record.recordedTick() > Math.max(40, config.entitySweepIntervalTicks * 4L)) {
+			return;
+		}
+
+		GlowZone zone = zones.get(record.zoneId());
+		if (zone == null || !zone.worldKey().equals(world.getRegistryKey())) {
+			return;
+		}
+
+		if (zone.consumesPlayerDeath(world, config)) {
+			dirty = true;
+		}
+	}
+
 	public boolean allowDamage(LivingEntity entity, DamageSource source, float amount) {
 		if (config.pvpEnabled || !(entity instanceof ServerPlayerEntity targetPlayer)) {
 			return true;
@@ -131,8 +175,37 @@ public final class ZoneRegistry {
 		return targetZone == null && attackerZone == null;
 	}
 
+	public boolean beforeBlockBreak(ServerWorld world, ServerPlayerEntity player, BlockPos pos, BlockState state) {
+		if (!state.isOf(Blocks.RESPAWN_ANCHOR)) {
+			return true;
+		}
+
+		GlowZone hostileZone = findHostileZoneForAnchor(world, pos, player.getUuid());
+		if (hostileZone == null) {
+			return true;
+		}
+
+		AnchorDamageKey key = new AnchorDamageKey(world.getRegistryKey(), pos.toImmutable());
+		AnchorDamageProgress progress = anchorDamage.computeIfAbsent(key, unused -> new AnchorDamageProgress(0, world.getTime()));
+		progress = decayedProgress(progress, world.getTime());
+		int nextHits = progress.hits() + 1;
+		if (nextHits >= Math.max(1, config.anchorBreakHitsRequired)) {
+			anchorDamage.remove(key);
+			dirty = true;
+			return true;
+		}
+
+		anchorDamage.put(key, new AnchorDamageProgress(nextHits, world.getTime()));
+		applyAnchorBacklash(world, pos, player, hostileZone);
+		player.sendMessage(Text.literal("Anchor Damage: " + nextHits + "/" + Math.max(1, config.anchorBreakHitsRequired) + "."), true);
+		dirty = true;
+		return false;
+	}
+
 	public void onBlockBroken(ServerWorld world, BlockPos pos, BlockState oldState, @Nullable ServerPlayerEntity player) {
 		if (oldState.isOf(Blocks.RESPAWN_ANCHOR)) {
+			anchorDamage.remove(new AnchorDamageKey(world.getRegistryKey(), pos.toImmutable()));
+			triggerAnchorDestroyedExplosion(world, pos, player);
 			handleAnchorTransition(world, pos, oldState, Blocks.AIR.getDefaultState(), player);
 		}
 	}
@@ -157,6 +230,12 @@ public final class ZoneRegistry {
 			renameZone(zone.id(), stack.getCustomName().getString());
 			player.sendMessage(Text.literal("Zone renamed to " + describeZone(zone.id()) + "."), false);
 			return ActionResult.SUCCESS;
+		}
+
+		if (state.isOf(Blocks.RESPAWN_ANCHOR)
+			&& config.allowNonMemberPlayerDamage
+			&& stack.isOf(config.hostileFieldActivationItem())) {
+			return handleHostileFieldActivation(world, player, hand, hitPos);
 		}
 
 		return ActionResult.PASS;
@@ -198,6 +277,26 @@ public final class ZoneRegistry {
 		dirty = true;
 	}
 
+	public boolean addMember(UUID zoneId, ServerPlayerEntity member) {
+		GlowZone zone = zones.get(zoneId);
+		if (zone == null) {
+			return false;
+		}
+		zone.addMember(member.getUuid(), member.getGameProfile().name());
+		dirty = true;
+		return true;
+	}
+
+	public boolean removeMember(UUID zoneId, UUID memberUuid) {
+		GlowZone zone = zones.get(zoneId);
+		if (zone == null || !zone.members().containsKey(memberUuid)) {
+			return false;
+		}
+		zone.removeMember(memberUuid);
+		dirty = true;
+		return true;
+	}
+
 	public void removeZone(UUID zoneId) {
 		GlowZone zone = zones.remove(zoneId);
 		if (zone == null) {
@@ -207,6 +306,49 @@ public final class ZoneRegistry {
 		zoneSignatures.remove(ZoneSignature.of(zone.worldKey(), zone.anchors()));
 		removeZoneIndexes(zone);
 		dirty = true;
+	}
+
+	private ActionResult handleHostileFieldActivation(ServerWorld world, ServerPlayerEntity player, Hand hand, BlockPos anchor) {
+		GlowZone zone = findOwnedZoneByAnchor(world, anchor, player.getUuid());
+		if (zone == null) {
+			return ActionResult.PASS;
+		}
+		if (zone.hostileToNonMembers()) {
+			player.sendMessage(Text.literal("Zone " + describeZone(zone.id()) + " is already overcharged to be hostile against non-members."), false);
+			return ActionResult.SUCCESS;
+		}
+		if (zone.state(world, config) != ZoneState.FORCE_FIELD) {
+			player.sendMessage(Text.literal("The zone must be fully charged before it can be hostile against non-members."), false);
+			return ActionResult.SUCCESS;
+		}
+
+		ItemStack stack = player.getStackInHand(hand);
+		if (stack.isEmpty()) {
+			return ActionResult.PASS;
+		}
+
+		PendingHostileActivationKey key = new PendingHostileActivationKey(zone.id(), player.getUuid());
+		Set<BlockPos> activatedAnchors = pendingHostileActivations.computeIfAbsent(key, unused -> new HashSet<>());
+		BlockPos immutableAnchor = anchor.toImmutable();
+		if (activatedAnchors.contains(immutableAnchor)) {
+			player.sendMessage(Text.literal("That anchor is already overcharged for hostility against non-members."), false);
+			return ActionResult.SUCCESS;
+		}
+
+		activatedAnchors.add(immutableAnchor);
+		stack.decrement(1);
+		dirty = true;
+
+		if (activatedAnchors.containsAll(zone.anchors())) {
+			zone.armAgainstNonMembers(world, config);
+			pendingHostileActivations.remove(key);
+			player.sendMessage(Text.literal("Zone " + describeZone(zone.id()) + " is now overcharged for hostile mode against non-members."), false);
+			maybeNotifyZoneMode(world, zone);
+		} else {
+			player.sendMessage(Text.literal("Overcharged " + activatedAnchors.size() + "/" + zone.anchors().size() + " anchors of " + describeZone(zone.id()) + " to be hostile against non-members."), false);
+		}
+
+		return ActionResult.SUCCESS;
 	}
 
 	public String describeZone(@Nullable UUID zoneId) {
@@ -221,7 +363,10 @@ public final class ZoneRegistry {
 		return "Zone " + describeZone(zone.id())
 			+ " owner=" + zone.ownerName()
 			+ " world=" + zone.worldKey().getValue()
-			+ " anchors=" + GlowZone.sortedAnchors(zone.anchors());
+			+ " anchors=" + GlowZone.sortedAnchors(zone.anchors())
+			+ " members=" + zone.members().values()
+			+ " hostile=" + zone.hostileToNonMembers()
+			+ " remaining_ticks=" + zone.remainingActiveTicks();
 	}
 
 	private void handleAnchorTransition(ServerWorld world, BlockPos pos, BlockState oldState, BlockState newState, @Nullable ServerPlayerEntity owner) {
@@ -247,6 +392,7 @@ public final class ZoneRegistry {
 
 		if (oldState.contains(RespawnAnchorBlock.CHARGES) && newState.contains(RespawnAnchorBlock.CHARGES)
 			&& !oldState.get(RespawnAnchorBlock.CHARGES).equals(newState.get(RespawnAnchorBlock.CHARGES))) {
+			resetZonesForAnchor(world, pos);
 			dirty = true;
 		}
 	}
@@ -306,11 +452,19 @@ public final class ZoneRegistry {
 				continue;
 			}
 
-			for (Entity entity : world.getOtherEntities(null, zone.runtimeBounds(world).expand(1.0), checked -> !checked.isSpectator())) {
+			for (Entity entity : world.getOtherEntities(null, zone.runtimeBounds(world).expand(1.0), checked -> !checked.isSpectator() && !(checked instanceof ServerPlayerEntity))) {
 				if (!zone.contains(entity.getBlockPos())) {
 					continue;
 				}
 				applyZoneEffects(world, zone, state, entity);
+			}
+
+			for (ServerPlayerEntity player : world.getPlayers()) {
+				if (player.isSpectator() || !zone.contains(player.getBlockPos())) {
+					continue;
+				}
+				logHostileZoneCheck(world, zone, state, player, "player-inside-zone");
+				applyZoneEffects(world, zone, state, player);
 			}
 		}
 	}
@@ -327,8 +481,46 @@ public final class ZoneRegistry {
 			return;
 		}
 
-		if (entity instanceof ServerPlayerEntity player && config.damagePlayers && state == ZoneState.FORCE_FIELD) {
-			player.damage(world, world.getDamageSources().magic(), (float) config.forceFieldDamage);
+		if (entity instanceof ServerPlayerEntity player && state == ZoneState.FORCE_FIELD) {
+			boolean hostileActive = zone.isHostileProtectionActive(world, config);
+			boolean member = zone.isMember(player.getUuid());
+			logHostileZoneCheck(world, zone, state, player, "apply-effects hostileActive=" + hostileActive + " member=" + member);
+			if (hostileActive && !member) {
+				long now = world.getTime();
+				Long lastTick = lastHostileDamageTicks.get(player.getUuid());
+				boolean intervalElapsed = lastTick == null
+					|| config.hostileFieldDamageIntervalTicks <= 0
+					|| now >= lastTick + config.hostileFieldDamageIntervalTicks;
+				if (intervalElapsed) {
+					debugLog(
+						"damaging non-member player={} zone={} now={} lastTick={} interval={} damage={}",
+						player.getGameProfile().name(),
+						describeZone(zone.id()),
+						now,
+						lastTick,
+						config.hostileFieldDamageIntervalTicks,
+						config.hostileFieldDamage
+					);
+					player.damage(world, world.getDamageSources().magic(), (float) config.hostileFieldDamage);
+					recentPlayerZoneDamage.put(player.getUuid(), new ZoneDamageRecord(zone.id(), now));
+					lastHostileDamageTicks.put(player.getUuid(), now);
+					dirty = true;
+				} else {
+					debugLog(
+						"skipped hostile damage due to interval player={} zone={} now={} lastTick={} interval={}",
+						player.getGameProfile().name(),
+						describeZone(zone.id()),
+						now,
+						lastTick,
+						config.hostileFieldDamageIntervalTicks
+					);
+				}
+				return;
+			}
+
+			if (config.damagePlayers) {
+				player.damage(world, world.getDamageSources().magic(), (float) config.forceFieldDamage);
+			}
 		}
 	}
 
@@ -350,7 +542,7 @@ public final class ZoneRegistry {
 			return;
 		}
 
-		ParticleEffect particle = config.particleFor(state);
+		ParticleEffect particle = zone.isHostileProtectionActive(world, config) ? config.hostileFieldParticle() : config.particleFor(state);
 		Box bounds = zone.particleBounds(config);
 		double step = Math.max(0.5, config.particleStep);
 
@@ -402,9 +594,45 @@ public final class ZoneRegistry {
 
 	private void spawnColumn(ServerWorld world, ParticleEffect particle, double x, double minY, double maxY, double z) {
 		double step = Math.max(0.5, config.particleStep);
+		double lastY = Double.NEGATIVE_INFINITY;
 		for (double y = minY; y <= maxY; y += step) {
 			world.spawnParticles(particle, x + 0.5, y + 0.5, z + 0.5, 1, 0, 0, 0, 0);
+			lastY = y;
 		}
+		if (Math.abs(lastY - maxY) > 1.0E-4) {
+			world.spawnParticles(particle, x + 0.5, maxY + 0.5, z + 0.5, 1, 0, 0, 0, 0);
+		}
+	}
+
+	private void triggerAnchorDestroyedExplosion(ServerWorld world, BlockPos pos, @Nullable ServerPlayerEntity player) {
+		if (config.anchorDestroyedExplosionPower <= 0) {
+			return;
+		}
+		if (player == null) {
+			return;
+		}
+
+		boolean shouldExplode = false;
+		for (UUID zoneId : anchorToZones.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(pos, Set.of())) {
+			GlowZone zone = zones.get(zoneId);
+			if (zone != null && zone.isHostileProtectionActive(world, config) && !zone.isMember(player.getUuid())) {
+				shouldExplode = true;
+				break;
+			}
+		}
+		if (!shouldExplode) {
+			return;
+		}
+
+		world.createExplosion(
+			null,
+			pos.getX() + 0.5,
+			pos.getY() + 0.5,
+			pos.getZ() + 0.5,
+			(float) config.anchorDestroyedExplosionPower,
+			config.anchorDestroyedExplosionCreatesFire,
+			World.ExplosionSourceType.TNT
+		);
 	}
 
 	private void registerZone(GlowZone zone) {
@@ -466,6 +694,105 @@ public final class ZoneRegistry {
 		for (UUID zoneId : ids) {
 			removeZone(zoneId);
 		}
+	}
+
+	private void applyAnchorBacklash(ServerWorld world, BlockPos anchor, ServerPlayerEntity player, GlowZone zone) {
+		if (config.backlashDamage > 0) {
+			player.damage(world, world.getDamageSources().magic(), (float) config.backlashDamage);
+			recentPlayerZoneDamage.put(player.getUuid(), new ZoneDamageRecord(zone.id(), world.getTime()));
+		}
+
+		if (config.backlashKnockback > 0) {
+			double dx = player.getX() - (anchor.getX() + 0.5);
+			double dz = player.getZ() - (anchor.getZ() + 0.5);
+			if (Math.abs(dx) < 1.0E-4 && Math.abs(dz) < 1.0E-4) {
+				dz = 1.0;
+			}
+			player.takeKnockback(config.backlashKnockback, dx, dz);
+		}
+
+		if (config.backlashSlownessTicks > 0) {
+			player.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, config.backlashSlownessTicks, Math.max(0, config.backlashSlownessAmplifier)));
+		}
+		if (config.backlashWitherTicks > 0) {
+			player.addStatusEffect(new StatusEffectInstance(StatusEffects.WITHER, config.backlashWitherTicks, Math.max(0, config.backlashWitherAmplifier)));
+		}
+	}
+
+	@Nullable
+	private GlowZone findHostileZoneForAnchor(ServerWorld world, BlockPos anchor, UUID playerUuid) {
+		for (UUID zoneId : anchorToZones.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(anchor, Set.of())) {
+			GlowZone zone = zones.get(zoneId);
+			if (zone != null && !zone.isMember(playerUuid) && zone.isHostileProtectionActive(world, config)) {
+				return zone;
+			}
+		}
+		return null;
+	}
+
+	private AnchorDamageProgress decayedProgress(AnchorDamageProgress progress, long currentTick) {
+		if (!config.hitDecayEnabled || progress.hits() <= 0 || config.hitDecayTimeTicks <= 0) {
+			return progress;
+		}
+
+		long elapsed = Math.max(0, currentTick - progress.lastUpdatedTick());
+		int decayedHits = Math.max(0, progress.hits() - (int) (elapsed / config.hitDecayTimeTicks));
+		long updatedTick = decayedHits == progress.hits() ? progress.lastUpdatedTick() : currentTick;
+		return new AnchorDamageProgress(decayedHits, updatedTick);
+	}
+
+	private void resetZonesForAnchor(ServerWorld world, BlockPos anchor) {
+		Set<UUID> ids = anchorToZones.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(anchor, Set.of());
+		for (UUID zoneId : ids) {
+			GlowZone zone = zones.get(zoneId);
+			if (zone != null) {
+				zone.resetForCurrentCharge(world, config);
+				pendingHostileActivations.entrySet().removeIf(entry -> entry.getKey().zoneId().equals(zoneId));
+				maybeNotifyZoneMode(world, zone);
+			}
+		}
+	}
+
+	private void maybeNotifyZoneMode(ServerWorld world, GlowZone zone) {
+		if (server == null || !zone.worldKey().equals(world.getRegistryKey())) {
+			return;
+		}
+
+		String modeKey = zone.currentModeKey(world, config);
+		if (!zone.markModeAnnounced(modeKey)) {
+			return;
+		}
+
+		ServerPlayerEntity owner = server.getPlayerManager().getPlayer(zone.ownerUuid());
+		if (owner == null) {
+			return;
+		}
+
+		owner.sendMessage(Text.literal("Zone " + describeZone(zone.id()) + " is now in " + zone.currentModeLabel(world, config) + "."), false);
+	}
+
+	private void logHostileZoneCheck(ServerWorld world, GlowZone zone, ZoneState state, ServerPlayerEntity player, String context) {
+		debugLog(
+			"{} player={} zone={} state={} mode={} hostileFlag={} hostileActive={} member={} pos={} remainingTicks={} deathsRemaining={}",
+			context,
+			player.getGameProfile().name(),
+			describeZone(zone.id()),
+			state.serializedName(),
+			zone.currentModeKey(world, config),
+			zone.hostileToNonMembers(),
+			zone.isHostileProtectionActive(world, config),
+			zone.isMember(player.getUuid()),
+			player.getBlockPos(),
+			zone.remainingActiveTicks(),
+			zone.hostilePlayerDeathsRemaining()
+		);
+	}
+
+	private void debugLog(String message, Object... args) {
+		if (!config.debugLoggingEnabled) {
+			return;
+		}
+		lnjustin.glowfield.GlowField.LOGGER.info("[GlowField debug] " + message, args);
 	}
 
 	private void addAnchor(RegistryKey<World> worldKey, BlockPos pos) {
@@ -599,6 +926,25 @@ public final class ZoneRegistry {
 		return server.getPlayerManager().getPlayer(claim.ownerUuid());
 	}
 
+	private void syncZonesForSave(MinecraftServer server) {
+		boolean changed = false;
+		for (GlowZone zone : zones.values()) {
+			ServerWorld world = server.getWorld(zone.worldKey());
+			if (world == null) {
+				continue;
+			}
+
+			long before = zone.remainingActiveTicks();
+			zone.syncRuntime(world, config);
+			if (zone.remainingActiveTicks() != before) {
+				changed = true;
+			}
+		}
+		if (changed) {
+			dirty = true;
+		}
+	}
+
 	private void clearRuntimeState() {
 		zones.clear();
 		chunkIndex.clear();
@@ -607,6 +953,10 @@ public final class ZoneRegistry {
 		loadedZoneIds.clear();
 		zoneSignatures.clear();
 		pendingPlacements.clear();
+		pendingHostileActivations.clear();
+		recentPlayerZoneDamage.clear();
+		anchorDamage.clear();
+		lastHostileDamageTicks.clear();
 	}
 
 	private record ZoneSignature(RegistryKey<World> worldKey, List<BlockPos> anchors) {
@@ -619,5 +969,17 @@ public final class ZoneRegistry {
 	}
 
 	private record PlacementClaim(UUID ownerUuid, long recordedTick) {
+	}
+
+	private record PendingHostileActivationKey(UUID zoneId, UUID playerUuid) {
+	}
+
+	private record ZoneDamageRecord(UUID zoneId, long recordedTick) {
+	}
+
+	private record AnchorDamageKey(RegistryKey<World> worldKey, BlockPos pos) {
+	}
+
+	private record AnchorDamageProgress(int hits, long lastUpdatedTick) {
 	}
 }

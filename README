@@ -90,15 +90,120 @@ Force fields are not infinite:
 
     ⚙️ Configuration
 
-    Config file is generated at: /config/glowfield.json
+    Config file is generated at: `/config/glowfield.json`
 
-    Options
-    	•	enableParticles — toggle rendering
-    	•	suppressionThreshold — mobs required to degrade field
-    	•	forceFieldDamage — damage dealt to mobs
-    	•	forceFieldParticle — particle for full field
-    	•	spawnPreventionParticle — particle for weak field
-    	•	inactiveParticle — fallback particle
+    Example
+
+```json
+{
+  "particlesEnabled": true,
+  "damagePlayers": false,
+  "pvpEnabled": false,
+  "suppressMobSpawns": true,
+  "damageMobs": true,
+  "nameTagNamingEnabled": true,
+  "allowNonMemberPlayerDamage": true,
+  "persistCachedBounds": true,
+  "renderVerticalParticleEdges": true,
+  "renderTopParticleFace": false,
+  "renderBottomParticleFace": false,
+  "renderParticlesDownToGround": true,
+  "renderParticlesForPartialState": true,
+  "renderParticlesForForceFieldState": true,
+  "renderParticlesForDegradingState": true,
+  "forceFieldMinCharge": 4,
+  "partialMinCharge": 1,
+  "degradeEveryMobInteractions": 50,
+  "degradingStateThreshold": 25,
+  "hostileFieldPlayerDeathLimit": 5,
+  "anchorBreakHitsRequired": 20,
+  "particleIntervalTicks": 20,
+  "entitySweepIntervalTicks": 10,
+  "saveFlushIntervalTicks": 200,
+  "particleRenderHeightBlocks": 1,
+  "partialFieldDurationTicks": 240000,
+  "forceFieldDurationTicks": 120000,
+  "hostileForceFieldDurationTicks": 48000,
+  "hostileFieldDamageIntervalTicks": 20,
+  "forceFieldDamage": 4.0,
+  "hostileFieldDamage": 4.0,
+  "backlashDamage": 4.0,
+  "backlashKnockback": 1.0,
+  "anchorDestroyedExplosionPower": 0.0,
+  "particleStep": 1.5,
+  "particleViewPadding": 32.0,
+  "hostileFieldActivationItem": "minecraft:echo_shard",
+  "hostileFieldParticle": "minecraft:soul_fire_flame",
+  "hitDecayEnabled": false,
+  "anchorDestroyedExplosionCreatesFire": false,
+  "hitDecayTimeTicks": 200,
+  "backlashSlownessTicks": 60,
+  "backlashSlownessAmplifier": 1,
+  "backlashWitherTicks": 0,
+  "backlashWitherAmplifier": 0,
+  "stateParticles": {
+    "degrading": "minecraft:ash",
+    "inactive": "minecraft:end_rod",
+    "force_field": "minecraft:portal",
+    "partial": "minecraft:flash"
+  }
+}
+```
+
+    What each setting means
+    	•	`particlesEnabled` — master switch for all zone particle rendering.
+    	•	`damagePlayers` — if `true`, players inside a force-field-state zone take periodic magic damage during entity sweeps.
+    	•	`pvpEnabled` — if `false`, player-vs-player damage is blocked when either the attacker or target is inside any zone.
+    	•	`suppressMobSpawns` — if `true`, mob spawning is denied inside active zones (partial, degrading, or force field).
+    	•	`damageMobs` — if `true`, mobs entering a force-field-state zone are killed by the zone during entity sweeps.
+    	•	`nameTagNamingEnabled` — allows a player to rename their own zone by using a named Name Tag on one of that zone’s anchors.
+    	•	`allowNonMemberPlayerDamage` — enables the hostile-zone mode that damages players who are neither the owner nor a member.
+    	•	`persistCachedBounds` — currently unused by the code. It is saved in the config but does not change runtime behavior at the moment.
+    	•	`renderVerticalParticleEdges` — renders particle columns around the zone perimeter.
+    	•	`renderTopParticleFace` — renders a particle surface across the top face of the particle box.
+    	•	`renderBottomParticleFace` — renders a particle surface across the bottom face of the particle box.
+    	•	`renderParticlesDownToGround` — extends perimeter particle columns downward to the terrain instead of starting exactly at anchor height.
+    	•	`renderParticlesForPartialState` — enables particles when a zone is in partial state.
+    	•	`renderParticlesForForceFieldState` — enables particles when a zone is in full force-field state.
+    	•	`renderParticlesForDegradingState` — enables particles when a zone is in degrading state.
+    	•	`forceFieldMinCharge` — minimum anchor charge required for a zone to enter `force_field` state.
+    	•	`partialMinCharge` — minimum anchor charge required for a zone to be active at all. If any anchor is below this value, the zone is inactive.
+    	•	`degradeEveryMobInteractions` — number of counted zone interactions before every anchor loses 1 charge.
+    	•	`degradingStateThreshold` — interaction progress value at which an active zone switches from normal behavior to the `degrading` visual state.
+    	•	`hostileFieldPlayerDeathLimit` — how many player deaths a hostile zone can inflict before the field collapses and becomes inactive until recharge.
+    	•	`anchorBreakHitsRequired` — how many outsider break attempts a hostile anchor can absorb before the next attempt is allowed to destroy it. Default is `20`.
+    	•	`particleIntervalTicks` — how often particles are rendered. `20` ticks is about once per second.
+    	•	`entitySweepIntervalTicks` — how often entities inside loaded zones are checked for damage effects.
+    	•	`saveFlushIntervalTicks` — how often dirty zone data is flushed to disk automatically.
+    	•	`particleRenderHeightBlocks` — height of the particle box above the anchor Y level. `1` renders a single-block-tall band.
+    	•	`partialFieldDurationTicks` — maximum lifetime of the weaker spawn-prevention field before recharge is needed. Default is 10 Minecraft days.
+    	•	`forceFieldDurationTicks` — maximum lifetime of a standard force field before recharge is needed. Default is 5 Minecraft days.
+    	•	`hostileForceFieldDurationTicks` — maximum lifetime of the hostile player-damaging force field before recharge is needed. Default is 2 Minecraft days.
+    	•	`forceFieldDamage` — amount of player damage per sweep when `damagePlayers` is enabled. This is separate from hostile-zone outsider damage.
+    	•	`hostileFieldDamageIntervalTicks` — how often a hostile zone damages non-members standing inside it.
+    	•	`hostileFieldDamage` — damage dealt each hostile-zone damage tick to a non-owner, non-member player inside the zone.
+    	•	`backlashDamage` — magic damage dealt to outsiders when they try to break an anchor in a hostile zone.
+    	•	`backlashKnockback` — knockback strength applied to outsiders when they try to break an anchor in a hostile zone.
+    	•	`anchorDestroyedExplosionPower` — explosion power applied when an anchor is actually destroyed. Set to `0.0` to disable explosions.
+    	•	`particleStep` — spacing between particle samples. Lower values create denser walls but cost more packets.
+    	•	`particleViewPadding` — currently present in config, but not used by the current rendering code.
+    	•	`hostileFieldActivationItem` — item consumed on each anchor interaction while attuning a fully charged zone into hostile mode.
+    	•	`hostileFieldParticle` — particle used while a hostile non-member-damaging zone is active.
+    	•	`anchorDestroyedExplosionCreatesFire` — if `true`, anchor-destruction explosions can create fire.
+    	•	`hitDecayEnabled` — if `true`, anchor break progress from outsiders decays over time instead of accumulating forever.
+    	•	`hitDecayTimeTicks` — decay interval used when `hitDecayEnabled` is on. Every interval removes 1 stored hit from an anchor.
+    	•	`backlashSlownessTicks` / `backlashSlownessAmplifier` — optional slowness effect applied during anchor backlash. Set duration to `0` to disable.
+    	•	`backlashWitherTicks` / `backlashWitherAmplifier` — optional wither effect applied during anchor backlash. Set duration to `0` to disable.
+    	•	`stateParticles.inactive` — particle id reserved for inactive zones. Inactive zones currently do not render particles, so this is effectively unused unless rendering logic changes.
+    	•	`stateParticles.partial` — particle id used for partial-state zones.
+    	•	`stateParticles.force_field` — particle id used for force-field-state zones.
+    	•	`stateParticles.degrading` — particle id used for degrading-state zones.
+
+    Zone states
+    	•	`inactive` — any anchor is below `partialMinCharge`; no protection effects run.
+    	•	`partial` — all anchors meet `partialMinCharge`, but the zone has not reached full force-field charge.
+    	•	`force_field` — all anchors meet `forceFieldMinCharge`; this is the state that damages mobs and can optionally damage non-members if the hostile mode has been attuned.
+    	•	`degrading` — interaction progress has reached `degradingStateThreshold` and the zone still has charge remaining. This is a warning state before the next charge loss event.
 
     ⸻
 
@@ -107,3 +212,11 @@ Force fields are not infinite:
     	2.	Charge them using Glowstone
     	3.	Ensure all anchors meet charge requirements
     	4.	Zone activates automatically
+
+    Hostile Player-Damaging Mode
+    	1.	Stand inside your own fully charged zone
+    	2.	Use the configured activation item on each of the 4 anchors
+    	3.	Each anchor interaction consumes 1 item
+    	4.	After all 4 anchors are attuned, the zone damages players who are not the owner and not zone members
+    	5.	Use `/glowfield member add <player>` and `/glowfield member remove <player>` while standing in your zone to manage safe players
+    	6.	Outsiders cannot break hostile anchors instantly. Their break attempts are canceled, backlash is applied, and the anchor only breaks after enough accumulated hits

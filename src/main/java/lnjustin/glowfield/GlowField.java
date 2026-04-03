@@ -43,6 +43,14 @@ public final class GlowField implements ModInitializer {
 		ServerEntityWorldChangeEvents.AFTER_ENTITY_CHANGE_WORLD.register((oldEntity, newEntity, origin, destination) -> zoneRegistry.onEntityLoad(newEntity, destination));
 		ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, origin, destination) -> zoneRegistry.onPlayerJoin(player));
 		net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents.ALLOW_DAMAGE.register(zoneRegistry::allowDamage);
+		net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents.AFTER_DEATH.register(zoneRegistry::onEntityDeath);
+
+		PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, blockEntity) -> {
+			if (player instanceof net.minecraft.server.network.ServerPlayerEntity serverPlayer) {
+				return zoneRegistry.beforeBlockBreak((ServerWorld) world, serverPlayer, pos, state);
+			}
+			return true;
+		});
 
 		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
 			if (player instanceof net.minecraft.server.network.ServerPlayerEntity serverPlayer) {
