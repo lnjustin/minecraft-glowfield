@@ -26,6 +26,8 @@ public final class GlowFieldConfig {
 	public boolean pvpEnabled = false;
 	public boolean suppressMobSpawns = true;
 	public boolean damageMobs = true;
+	public Boolean damageHostileMobs = null;
+	public Boolean damageNonHostileMobs = null;
 	public boolean debugLoggingEnabled = false;
 	public boolean nameTagNamingEnabled = true;
 	public boolean allowNonMemberPlayerDamage = true;
@@ -42,6 +44,7 @@ public final class GlowFieldConfig {
 	public int partialMinCharge = 1;
 	public int degradeEveryMobInteractions = 50;
 	public int degradingStateThreshold = 25;
+	public int mobInteractionNormalizationAreaBlocks = 256;
 	public int hostileFieldPlayerDeathLimit = 5;
 	public int anchorBreakHitsRequired = 20;
 	public int particleIntervalTicks = 20;
@@ -89,6 +92,7 @@ public final class GlowFieldConfig {
 				if (config.stateParticles == null || config.stateParticles.isEmpty()) {
 					config.stateParticles = defaultParticles();
 				}
+				config.applyDerivedDefaults();
 
 				save(config);
 				return config;
@@ -101,6 +105,7 @@ public final class GlowFieldConfig {
 
 	public static void save(GlowFieldConfig config) {
 		try {
+			config.applyDerivedDefaults();
 			Files.createDirectories(FILE.getParent());
 			try (Writer writer = Files.newBufferedWriter(FILE)) {
 				GSON.toJson(config, writer);
@@ -111,8 +116,9 @@ public final class GlowFieldConfig {
 	}
 
 	public ParticleEffect particleFor(ZoneStateLike state) {
-		String id = stateParticles.getOrDefault(state.serializedName(), "minecraft:end_rod");
-		return particleFromId(id, ParticleTypes.END_ROD);
+		ParticleEffect fallback = fallbackParticleFor(state.serializedName());
+		String id = stateParticles.getOrDefault(state.serializedName(), defaultParticleIdFor(state.serializedName()));
+		return particleFromId(id, fallback);
 	}
 
 	public ParticleEffect hostileFieldParticle() {
@@ -130,6 +136,28 @@ public final class GlowFieldConfig {
 			return item == null ? Items.ECHO_SHARD : item;
 		} catch (Exception exception) {
 			return Items.ECHO_SHARD;
+		}
+	}
+
+	public boolean damageHostileMobs() {
+		return damageHostileMobs != null ? damageHostileMobs : damageMobs;
+	}
+
+	public boolean damageNonHostileMobs() {
+		return damageNonHostileMobs != null ? damageNonHostileMobs : damageMobs;
+	}
+
+	private void applyDerivedDefaults() {
+		if (damageHostileMobs == null) {
+			damageHostileMobs = damageMobs;
+		}
+		if (damageNonHostileMobs == null) {
+			damageNonHostileMobs = damageMobs;
+		}
+		if (stateParticles == null) {
+			stateParticles = defaultParticles();
+		} else {
+			defaultParticles().forEach(stateParticles::putIfAbsent);
 		}
 	}
 
@@ -154,6 +182,19 @@ public final class GlowFieldConfig {
 		particles.put("force_field", "minecraft:portal");
 		particles.put("degrading", "minecraft:ash");
 		return particles;
+	}
+
+	private static String defaultParticleIdFor(String state) {
+		return defaultParticles().getOrDefault(state, "minecraft:end_rod");
+	}
+
+	private static ParticleEffect fallbackParticleFor(String state) {
+		return switch (state) {
+			case "partial" -> ParticleTypes.SMOKE;
+			case "force_field" -> ParticleTypes.PORTAL;
+			case "degrading" -> ParticleTypes.ASH;
+			default -> ParticleTypes.END_ROD;
+		};
 	}
 
 	public interface ZoneStateLike {

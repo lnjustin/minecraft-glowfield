@@ -5,7 +5,9 @@ import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.RespawnAnchorBlock;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.SpawnGroup;
 import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
@@ -13,6 +15,7 @@ import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.particle.ParticleEffect;
+import net.minecraft.registry.Registries;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -47,14 +50,17 @@ public final class ZoneRegistry {
 	private final Map<RegistryKey<World>, Map<ChunkPos, Set<UUID>>> chunkIndex = new HashMap<>();
 	private final Map<RegistryKey<World>, Map<BlockPos, Set<UUID>>> anchorToZones = new HashMap<>();
 	private final Map<RegistryKey<World>, Map<Integer, Set<BlockPos>>> anchorsByY = new HashMap<>();
-	private final Map<RegistryKey<World>, Set<UUID>> loadedZoneIds = new HashMap<>();
+	private final Map<RegistryKey<World>, Set<ChunkPos>> loadedChunks = new HashMap<>();
 	private final Map<ZoneSignature, UUID> zoneSignatures = new HashMap<>();
 	private final Map<PendingPlacementKey, PlacementClaim> pendingPlacements = new HashMap<>();
 	private final Map<PendingHostileActivationKey, Set<BlockPos>> pendingHostileActivations = new HashMap<>();
 	private final Map<UUID, ZoneDamageRecord> recentPlayerZoneDamage = new HashMap<>();
 	private final Map<AnchorDamageKey, AnchorDamageProgress> anchorDamage = new HashMap<>();
 	private final Map<UUID, Long> lastHostileDamageTicks = new HashMap<>();
+	private final Set<UUID> timeDegradationWarningZoneIds = new HashSet<>();
+	private final Set<UUID> mobDegradationWarningZoneIds = new HashSet<>();
 	private MinecraftServer server;
+	private int internalAnchorChargeUpdates;
 	private boolean dirty;
 
 	public ZoneRegistry(GlowFieldConfig config) {
@@ -85,25 +91,32 @@ public final class ZoneRegistry {
 
 	public void onChunkLoad(ServerWorld world, WorldChunk chunk) {
 		indexChunkAnchors(world, chunk);
-		loadedZoneIds
+		if (chunkIndex.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(chunk.getPos(), Set.of()).isEmpty()) {
+			return;
+		}
+
+		loadedChunks
 			.computeIfAbsent(world.getRegistryKey(), key -> new HashSet<>())
-			.addAll(chunkIndex.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(chunk.getPos(), Set.of()));
+			.add(chunk.getPos());
 	}
 
 	public void onChunkUnload(ServerWorld world, WorldChunk chunk) {
-		Set<UUID> active = loadedZoneIds.computeIfAbsent(world.getRegistryKey(), key -> new HashSet<>());
-		active.removeAll(chunkIndex.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(chunk.getPos(), Set.of()));
+		Set<ChunkPos> chunks = loadedChunks.get(world.getRegistryKey());
+		if (chunks == null) {
+			return;
+		}
+
+		chunks.remove(chunk.getPos());
+		if (chunks.isEmpty()) {
+			loadedChunks.remove(world.getRegistryKey());
+		}
 	}
 
 	public void onEndWorldTick(ServerWorld world) {
 		boolean changed = false;
 		for (GlowZone zone : loadedZones(world)) {
-			long before = zone.remainingActiveTicks();
-			zone.syncRuntime(world, config);
+			changed |= syncZoneRuntimeAndHandleExpiry(world, zone);
 			maybeNotifyZoneMode(world, zone);
-			if (zone.remainingActiveTicks() != before) {
-				changed = true;
-			}
 		}
 		if (changed) {
 			dirty = true;
@@ -126,9 +139,8 @@ public final class ZoneRegistry {
 		if (zone == null || !(entity instanceof MobEntity mob)) {
 			return;
 		}
-		if (config.suppressMobSpawns && zone.state(world, config) != ZoneState.INACTIVE) {
+		if (config.suppressMobSpawns && zone.state(world, config) != ZoneState.INACTIVE && shouldSuppressMobSpawnInZone(mob)) {
 			mob.discard();
-			recordZoneInteraction(world, zone, 1);
 		}
 	}
 
@@ -157,6 +169,7 @@ public final class ZoneRegistry {
 		}
 
 		if (zone.consumesPlayerDeath(world, config)) {
+			clearDegradationWarnings(zone.id());
 			dirty = true;
 		}
 	}
@@ -195,6 +208,9 @@ public final class ZoneRegistry {
 			return true;
 		}
 
+		if (progress.hits() <= 0) {
+			notifyHostileAnchorDamageStarted(hostileZone, pos, player);
+		}
 		anchorDamage.put(key, new AnchorDamageProgress(nextHits, world.getTime()));
 		applyAnchorBacklash(world, pos, player, hostileZone);
 		player.sendMessage(Text.literal("Anchor Damage: " + nextHits + "/" + Math.max(1, config.anchorBreakHitsRequired) + "."), true);
@@ -204,6 +220,9 @@ public final class ZoneRegistry {
 
 	public void onBlockBroken(ServerWorld world, BlockPos pos, BlockState oldState, @Nullable ServerPlayerEntity player) {
 		if (oldState.isOf(Blocks.RESPAWN_ANCHOR)) {
+			if (player != null) {
+				notifyHostileAnchorDestroyed(world, pos, player);
+			}
 			anchorDamage.remove(new AnchorDamageKey(world.getRegistryKey(), pos.toImmutable()));
 			triggerAnchorDestroyedExplosion(world, pos, player);
 			handleAnchorTransition(world, pos, oldState, Blocks.AIR.getDefaultState(), player);
@@ -236,6 +255,18 @@ public final class ZoneRegistry {
 			&& config.allowNonMemberPlayerDamage
 			&& stack.isOf(config.hostileFieldActivationItem())) {
 			return handleHostileFieldActivation(world, player, hand, hitPos);
+		}
+
+		if (state.isOf(Blocks.RESPAWN_ANCHOR) && isManagedAnchor(world, hitPos) && stack.isOf(Items.GLOWSTONE)) {
+			return handleManagedAnchorGlowstoneUse(world, player, hand, hitPos, state);
+		}
+
+		if (state.isOf(Blocks.RESPAWN_ANCHOR) && isManagedAnchor(world, hitPos) && !stack.isOf(Items.GLOWSTONE)) {
+			GlowZone memberZone = findMemberZoneByAnchor(world, hitPos, player.getUuid());
+			if (memberZone != null) {
+				return handleManagedAnchorStatus(world, player, memberZone);
+			}
+			return ActionResult.SUCCESS;
 		}
 
 		return ActionResult.PASS;
@@ -303,6 +334,7 @@ public final class ZoneRegistry {
 			return;
 		}
 
+		clearDegradationWarnings(zoneId);
 		zoneSignatures.remove(ZoneSignature.of(zone.worldKey(), zone.anchors()));
 		removeZoneIndexes(zone);
 		dirty = true;
@@ -341,6 +373,7 @@ public final class ZoneRegistry {
 
 		if (activatedAnchors.containsAll(zone.anchors())) {
 			zone.armAgainstNonMembers(world, config);
+			clearDegradationWarnings(zone.id());
 			pendingHostileActivations.remove(key);
 			player.sendMessage(Text.literal("Zone " + describeZone(zone.id()) + " is now overcharged for hostile mode against non-members."), false);
 			maybeNotifyZoneMode(world, zone);
@@ -348,6 +381,41 @@ public final class ZoneRegistry {
 			player.sendMessage(Text.literal("Overcharged " + activatedAnchors.size() + "/" + zone.anchors().size() + " anchors of " + describeZone(zone.id()) + " to be hostile against non-members."), false);
 		}
 
+		return ActionResult.SUCCESS;
+	}
+
+	private ActionResult handleManagedAnchorGlowstoneUse(ServerWorld world, ServerPlayerEntity player, Hand hand, BlockPos anchor, BlockState state) {
+		if (!state.contains(RespawnAnchorBlock.CHARGES) || state.get(RespawnAnchorBlock.CHARGES) < maxAnchorCharge()) {
+			return ActionResult.PASS;
+		}
+
+		GlowZone zone = findMemberZoneByAnchor(world, anchor, player.getUuid());
+		if (zone == null) {
+			player.sendMessage(Text.literal("Only the owner or a member can recharge this GlowField anchor."), true);
+			return ActionResult.SUCCESS;
+		}
+
+		ItemStack stack = player.getStackInHand(hand);
+		if (stack.isEmpty()) {
+			return ActionResult.SUCCESS;
+		}
+
+		zone.resetForCurrentCharge(world, config);
+		clearDegradationWarnings(zone.id());
+		pendingHostileActivations.entrySet().removeIf(entry -> entry.getKey().zoneId().equals(zone.id()));
+		stack.decrement(1);
+		dirty = true;
+		player.sendMessage(Text.literal("Recharged GlowField zone " + describeZone(zone.id()) + ". " + degradationStatus(world, zone)), false);
+		maybeNotifyZoneMode(world, zone);
+		return ActionResult.SUCCESS;
+	}
+
+	private ActionResult handleManagedAnchorStatus(ServerWorld world, ServerPlayerEntity player, GlowZone zone) {
+		if (syncZoneRuntimeAndHandleExpiry(world, zone)) {
+			dirty = true;
+			maybeNotifyZoneMode(world, zone);
+		}
+		player.sendMessage(Text.literal(degradationStatus(world, zone)), false);
 		return ActionResult.SUCCESS;
 	}
 
@@ -392,6 +460,9 @@ public final class ZoneRegistry {
 
 		if (oldState.contains(RespawnAnchorBlock.CHARGES) && newState.contains(RespawnAnchorBlock.CHARGES)
 			&& !oldState.get(RespawnAnchorBlock.CHARGES).equals(newState.get(RespawnAnchorBlock.CHARGES))) {
+			if (internalAnchorChargeUpdates > 0) {
+				return;
+			}
 			resetZonesForAnchor(world, pos);
 			dirty = true;
 		}
@@ -471,7 +542,7 @@ public final class ZoneRegistry {
 
 	private void applyZoneEffects(ServerWorld world, GlowZone zone, ZoneState state, Entity entity) {
 		if (entity instanceof MobEntity mob) {
-			if (config.damageMobs && state == ZoneState.FORCE_FIELD) {
+			if (state == ZoneState.FORCE_FIELD && shouldDamageMobInForceField(mob)) {
 				boolean wasAlive = mob.isAlive();
 				mob.damage(world, world.getDamageSources().magic(), Float.MAX_VALUE);
 				if (wasAlive && !mob.isAlive()) {
@@ -524,25 +595,201 @@ public final class ZoneRegistry {
 		}
 	}
 
+	private boolean shouldDamageMobInForceField(MobEntity mob) {
+		if (isFriendlyGolem(mob)) {
+			return false;
+		}
+		return isHostileMob(mob) ? config.damageHostileMobs() : config.damageNonHostileMobs();
+	}
+
+	private boolean shouldSuppressMobSpawnInZone(MobEntity mob) {
+		return isHostileMob(mob);
+	}
+
+	private boolean isHostileMob(MobEntity mob) {
+		if (isFriendlyGolem(mob)) {
+			return false;
+		}
+		EntityType<?> entityType = mob.getType();
+		SpawnGroup spawnGroup = entityType.getSpawnGroup();
+		return spawnGroup == SpawnGroup.MONSTER;
+	}
+
+	private boolean isFriendlyGolem(MobEntity mob) {
+		String entityPath = Registries.ENTITY_TYPE.getId(mob.getType()).getPath();
+		return "iron_golem".equals(entityPath) || "copper_golem".equals(entityPath);
+	}
+
 	private void recordZoneInteraction(ServerWorld world, GlowZone zone, int interactions) {
 		if (zone.recordInteractionAndShouldDegrade(interactions, config)) {
+			degradeZone(world, zone, "mob interactions reached " + zone.effectiveDegradeEveryMobInteractions(config)
+				+ " for a " + zone.horizontalAreaBlocks() + "-block zone footprint");
+			return;
+		}
+		maybeWarnMobDegradation(world, zone);
+		dirty = true;
+	}
+
+	private boolean syncZoneRuntimeAndHandleExpiry(ServerWorld world, GlowZone zone) {
+		long before = zone.remainingActiveTicks();
+		zone.syncRuntime(world, config);
+		boolean changed = zone.remainingActiveTicks() != before;
+		if (before <= 0 || zone.remainingActiveTicks() > 0 || zone.minAnchorCharge(world) < config.partialMinCharge) {
+			maybeWarnTimeDegradation(world, zone);
+			return changed;
+		}
+
+		degradeZone(world, zone, "active duration expired");
+		return true;
+	}
+
+	private void degradeZone(ServerWorld world, GlowZone zone, String reason) {
+		int beforeCharge = zone.minAnchorCharge(world);
+		decrementZoneAnchorCharges(world, zone);
+		zone.resetForCurrentCharge(world, config);
+		clearDegradationWarnings(zone.id());
+		pendingHostileActivations.entrySet().removeIf(entry -> entry.getKey().zoneId().equals(zone.id()));
+		notifyZoneDegraded(world, zone, beforeCharge, zone.minAnchorCharge(world), reason);
+		maybeNotifyZoneMode(world, zone);
+		dirty = true;
+	}
+
+	private void decrementZoneAnchorCharges(ServerWorld world, GlowZone zone) {
+		internalAnchorChargeUpdates++;
+		try {
 			for (BlockPos anchor : zone.anchors()) {
 				BlockState state = world.getBlockState(anchor);
 				if (state.isOf(Blocks.RESPAWN_ANCHOR) && state.contains(RespawnAnchorBlock.CHARGES)) {
 					int nextCharge = Math.max(0, state.get(RespawnAnchorBlock.CHARGES) - 1);
-					world.setBlockState(anchor, state.with(RespawnAnchorBlock.CHARGES, nextCharge));
+					if (nextCharge != state.get(RespawnAnchorBlock.CHARGES)) {
+						world.setBlockState(anchor, state.with(RespawnAnchorBlock.CHARGES, nextCharge));
+					}
 				}
 			}
+		} finally {
+			internalAnchorChargeUpdates--;
 		}
-		dirty = true;
 	}
 
-	private void renderZoneParticles(ServerWorld world, GlowZone zone, ZoneState state) {
-		if (!shouldRenderParticlesForState(state)) {
+	private void maybeWarnTimeDegradation(ServerWorld world, GlowZone zone) {
+		long remaining = zone.remainingActiveTicks();
+		if (!zone.isNearingTimeDegradation(world, config)) {
+			timeDegradationWarningZoneIds.remove(zone.id());
 			return;
 		}
 
-		ParticleEffect particle = zone.isHostileProtectionActive(world, config) ? config.hostileFieldParticle() : config.particleFor(state);
+		if (timeDegradationWarningZoneIds.add(zone.id())) {
+			sendZoneMembers(
+				zone,
+				Text.literal("Warning: Zone " + describeZone(zone.id()) + " will degrade in " + formatMinecraftDuration(remaining) + " and lose 1 charge from each anchor."),
+				false
+			);
+		}
+	}
+
+	private void maybeWarnMobDegradation(ServerWorld world, GlowZone zone) {
+		int threshold = zone.mobDegradationWarningThreshold(config);
+		int degradeEvery = zone.effectiveDegradeEveryMobInteractions(config);
+		if (threshold <= 0 || degradeEvery <= 0 || zone.minAnchorCharge(world) < config.partialMinCharge || !zone.isNearingMobDegradation(config)) {
+			mobDegradationWarningZoneIds.remove(zone.id());
+			return;
+		}
+
+		if (mobDegradationWarningZoneIds.add(zone.id())) {
+			sendZoneMembers(
+				zone,
+				Text.literal("Warning: Zone " + describeZone(zone.id()) + " is nearing mob-interaction degradation ("
+					+ zone.interactionProgress() + "/" + degradeEvery + " for " + zone.horizontalAreaBlocks()
+					+ " blocks). At that ratio, each anchor will lose 1 charge."),
+				false
+			);
+		}
+	}
+
+	private void notifyZoneDegraded(ServerWorld world, GlowZone zone, int beforeCharge, int afterCharge, String reason) {
+		String message = "Zone " + describeZone(zone.id()) + " degraded because " + reason + ": each anchor lost 1 charge (" + beforeCharge + " -> " + afterCharge + "). "
+			+ degradationStatus(world, zone);
+		sendZoneMembers(zone, Text.literal(message), false);
+	}
+
+	private String degradationStatus(ServerWorld world, GlowZone zone) {
+		ZoneState state = zone.state(world, config);
+		int minCharge = zone.minAnchorCharge(world);
+		if (state == ZoneState.INACTIVE || zone.remainingActiveTicks() <= 0) {
+			return "Current mode: " + zone.currentModeLabel(world, config) + ". Anchor charge: " + minCharge + ". Recharge anchors to reactivate protection.";
+		}
+
+		return "Current mode: " + zone.currentModeLabel(world, config)
+			+ ". Anchor charge: " + minCharge
+			+ ". Next degradation in " + formatMinecraftDuration(zone.remainingActiveTicks()) + ".";
+	}
+
+	private String formatMinecraftDuration(long ticks) {
+		long totalMinutes = Math.max(0, (ticks * 60 + 999) / 1000);
+		if (totalMinutes <= 0) {
+			return "0 Minecraft minutes";
+		}
+
+		long days = totalMinutes / 1440;
+		long hours = (totalMinutes % 1440) / 60;
+		long minutes = totalMinutes % 60;
+		List<String> parts = new ArrayList<>();
+		if (days > 0) {
+			parts.add(formatMinecraftUnit(days, "day"));
+		}
+		if (hours > 0) {
+			parts.add(formatMinecraftUnit(hours, "hour"));
+		}
+		if (minutes > 0 || parts.isEmpty()) {
+			parts.add(formatMinecraftUnit(minutes, "minute"));
+		}
+		return String.join(", ", parts);
+	}
+
+	private String formatMinecraftUnit(long value, String unit) {
+		return value + " Minecraft " + unit + (value == 1 ? "" : "s");
+	}
+
+	private void sendZoneMembers(GlowZone zone, Text message, boolean actionBar) {
+		if (server == null) {
+			return;
+		}
+
+		Set<UUID> delivered = new HashSet<>();
+		sendZoneMessage(zone.ownerUuid(), message, actionBar, delivered);
+		for (UUID memberUuid : zone.members().keySet()) {
+			sendZoneMessage(memberUuid, message, actionBar, delivered);
+		}
+	}
+
+	private void sendZoneMessage(UUID playerUuid, Text message, boolean actionBar, Set<UUID> delivered) {
+		if (!delivered.add(playerUuid) || server == null) {
+			return;
+		}
+
+		ServerPlayerEntity player = server.getPlayerManager().getPlayer(playerUuid);
+		if (player != null) {
+			player.sendMessage(message, actionBar);
+		}
+	}
+
+	private void clearDegradationWarnings(UUID zoneId) {
+		timeDegradationWarningZoneIds.remove(zoneId);
+		mobDegradationWarningZoneIds.remove(zoneId);
+	}
+
+	private void renderZoneParticles(ServerWorld world, GlowZone zone, ZoneState state) {
+		if (shouldRenderParticlesForState(state)) {
+			ParticleEffect particle = zone.isHostileProtectionActive(world, config) ? config.hostileFieldParticle() : config.particleFor(state);
+			renderZoneParticleShell(world, zone, particle);
+		}
+
+		if (zone.hasDegradationWarning(world, config) && config.renderParticlesForDegradingState) {
+			renderZoneParticleShell(world, zone, config.particleFor(ZoneState.DEGRADING));
+		}
+	}
+
+	private void renderZoneParticleShell(ServerWorld world, GlowZone zone, ParticleEffect particle) {
 		Box bounds = zone.particleBounds(config);
 		double step = Math.max(0.5, config.particleStep);
 
@@ -635,10 +882,44 @@ public final class ZoneRegistry {
 		);
 	}
 
+	private void notifyHostileAnchorDamageStarted(GlowZone zone, BlockPos anchor, ServerPlayerEntity player) {
+		sendZoneMembers(
+			zone,
+			Text.literal("Warning: " + player.getGameProfile().name() + " is damaging an anchor in zone "
+				+ describeZone(zone.id()) + " at " + formatBlockPos(anchor) + "."),
+			false
+		);
+	}
+
+	private void notifyHostileAnchorDestroyed(ServerWorld world, BlockPos anchor, ServerPlayerEntity player) {
+		for (GlowZone zone : findHostileZonesForAnchor(world, anchor, player.getUuid())) {
+			sendZoneMembers(
+				zone,
+				Text.literal("Warning: " + player.getGameProfile().name() + " destroyed an anchor in zone "
+					+ describeZone(zone.id()) + " at " + formatBlockPos(anchor) + "."),
+				false
+			);
+		}
+	}
+
+	private String formatBlockPos(BlockPos pos) {
+		return pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
+	}
+
+	private boolean isManagedAnchor(ServerWorld world, BlockPos pos) {
+		return !anchorToZones.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(pos, Set.of()).isEmpty();
+	}
+
+	private int maxAnchorCharge() {
+		return RespawnAnchorBlock.CHARGES.getValues().stream()
+			.mapToInt(Integer::intValue)
+			.max()
+			.orElse(4);
+	}
+
 	private void registerZone(GlowZone zone) {
 		zones.put(zone.id(), zone);
 		zoneSignatures.put(ZoneSignature.of(zone.worldKey(), zone.anchors()), zone.id());
-		loadedZoneIds.computeIfAbsent(zone.worldKey(), key -> new HashSet<>()).add(zone.id());
 
 		for (BlockPos anchor : zone.anchors()) {
 			addAnchor(zone.worldKey(), anchor);
@@ -653,6 +934,29 @@ public final class ZoneRegistry {
 				.computeIfAbsent(zone.worldKey(), key -> new HashMap<>())
 				.computeIfAbsent(chunkPos, key -> new LinkedHashSet<>())
 				.add(zone.id());
+		}
+
+		markLoadedCoveredChunks(zone);
+	}
+
+	private void markLoadedCoveredChunks(GlowZone zone) {
+		if (server == null) {
+			return;
+		}
+
+		ServerWorld world = server.getWorld(zone.worldKey());
+		if (world == null) {
+			return;
+		}
+
+		Set<ChunkPos> chunks = loadedChunks.computeIfAbsent(zone.worldKey(), key -> new HashSet<>());
+		for (ChunkPos chunkPos : zone.coveredChunks()) {
+			if (world.getChunkManager().isChunkLoaded(chunkPos.x, chunkPos.z)) {
+				chunks.add(chunkPos);
+			}
+		}
+		if (chunks.isEmpty()) {
+			loadedChunks.remove(zone.worldKey());
 		}
 	}
 
@@ -683,10 +987,6 @@ public final class ZoneRegistry {
 			}
 		}
 
-		Set<UUID> active = loadedZoneIds.get(zone.worldKey());
-		if (active != null) {
-			active.remove(zone.id());
-		}
 	}
 
 	private void removeZonesForAnchor(RegistryKey<World> worldKey, BlockPos anchor) {
@@ -721,13 +1021,21 @@ public final class ZoneRegistry {
 
 	@Nullable
 	private GlowZone findHostileZoneForAnchor(ServerWorld world, BlockPos anchor, UUID playerUuid) {
+		for (GlowZone zone : findHostileZonesForAnchor(world, anchor, playerUuid)) {
+			return zone;
+		}
+		return null;
+	}
+
+	private List<GlowZone> findHostileZonesForAnchor(ServerWorld world, BlockPos anchor, UUID playerUuid) {
+		List<GlowZone> matches = new ArrayList<>();
 		for (UUID zoneId : anchorToZones.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(anchor, Set.of())) {
 			GlowZone zone = zones.get(zoneId);
 			if (zone != null && !zone.isMember(playerUuid) && zone.isHostileProtectionActive(world, config)) {
-				return zone;
+				matches.add(zone);
 			}
 		}
-		return null;
+		return matches;
 	}
 
 	private AnchorDamageProgress decayedProgress(AnchorDamageProgress progress, long currentTick) {
@@ -747,6 +1055,7 @@ public final class ZoneRegistry {
 			GlowZone zone = zones.get(zoneId);
 			if (zone != null) {
 				zone.resetForCurrentCharge(world, config);
+				clearDegradationWarnings(zoneId);
 				pendingHostileActivations.entrySet().removeIf(entry -> entry.getKey().zoneId().equals(zoneId));
 				maybeNotifyZoneMode(world, zone);
 			}
@@ -763,12 +1072,7 @@ public final class ZoneRegistry {
 			return;
 		}
 
-		ServerPlayerEntity owner = server.getPlayerManager().getPlayer(zone.ownerUuid());
-		if (owner == null) {
-			return;
-		}
-
-		owner.sendMessage(Text.literal("Zone " + describeZone(zone.id()) + " is now in " + zone.currentModeLabel(world, config) + "."), false);
+		sendZoneMembers(zone, Text.literal("Zone " + describeZone(zone.id()) + " is now in " + zone.currentModeLabel(world, config) + "."), false);
 	}
 
 	private void logHostileZoneCheck(ServerWorld world, GlowZone zone, ZoneState state, ServerPlayerEntity player, String context) {
@@ -902,9 +1206,27 @@ public final class ZoneRegistry {
 		return null;
 	}
 
+	@Nullable
+	private GlowZone findMemberZoneByAnchor(ServerWorld world, BlockPos anchor, UUID playerUuid) {
+		for (UUID zoneId : anchorToZones.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>()).getOrDefault(anchor, Set.of())) {
+			GlowZone zone = zones.get(zoneId);
+			if (zone != null && zone.isMember(playerUuid)) {
+				return zone;
+			}
+		}
+		return null;
+	}
+
 	private List<GlowZone> loadedZones(ServerWorld world) {
 		List<GlowZone> loaded = new ArrayList<>();
-		for (UUID zoneId : loadedZoneIds.computeIfAbsent(world.getRegistryKey(), key -> new HashSet<>())) {
+		Map<ChunkPos, Set<UUID>> worldChunks = chunkIndex.computeIfAbsent(world.getRegistryKey(), key -> new HashMap<>());
+		Set<ChunkPos> chunks = loadedChunks.getOrDefault(world.getRegistryKey(), Set.of());
+		Set<UUID> candidateZoneIds = new LinkedHashSet<>();
+		for (ChunkPos chunkPos : chunks) {
+			candidateZoneIds.addAll(worldChunks.getOrDefault(chunkPos, Set.of()));
+		}
+
+		for (UUID zoneId : candidateZoneIds) {
 			GlowZone zone = zones.get(zoneId);
 			if (zone != null) {
 				loaded.add(zone);
@@ -934,11 +1256,7 @@ public final class ZoneRegistry {
 				continue;
 			}
 
-			long before = zone.remainingActiveTicks();
-			zone.syncRuntime(world, config);
-			if (zone.remainingActiveTicks() != before) {
-				changed = true;
-			}
+			changed |= syncZoneRuntimeAndHandleExpiry(world, zone);
 		}
 		if (changed) {
 			dirty = true;
@@ -950,13 +1268,15 @@ public final class ZoneRegistry {
 		chunkIndex.clear();
 		anchorToZones.clear();
 		anchorsByY.clear();
-		loadedZoneIds.clear();
+		loadedChunks.clear();
 		zoneSignatures.clear();
 		pendingPlacements.clear();
 		pendingHostileActivations.clear();
 		recentPlayerZoneDamage.clear();
 		anchorDamage.clear();
 		lastHostileDamageTicks.clear();
+		timeDegradationWarningZoneIds.clear();
+		mobDegradationWarningZoneIds.clear();
 	}
 
 	private record ZoneSignature(RegistryKey<World> worldKey, List<BlockPos> anchors) {

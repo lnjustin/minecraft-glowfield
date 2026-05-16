@@ -13,8 +13,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(RespawnAnchorBlock.class)
 public abstract class RespawnAnchorBlockMixin {
-	@Inject(method = "charge", at = @At("HEAD"))
-	private static void glowfield$captureChargeBefore(Entity charger, World world, BlockPos pos, BlockState state, CallbackInfo ci) {
+	@Inject(method = "charge", at = @At("RETURN"))
+	private static void glowfield$emitChargeAfter(Entity charger, World world, BlockPos pos, BlockState state, CallbackInfo ci) {
 		if (!world.isClient()) {
 			GlowField.zones().onAnchorStateChanged((net.minecraft.server.world.ServerWorld) world, pos, state, world.getBlockState(pos));
 		}

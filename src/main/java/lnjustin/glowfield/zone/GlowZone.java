@@ -133,6 +133,13 @@ public final class GlowZone {
 		return interactionProgress;
 	}
 
+	public int horizontalAreaBlocks() {
+		int width = Math.max(1, (int) Math.floor(bounds.maxX - bounds.minX) + 1);
+		int depth = Math.max(1, (int) Math.floor(bounds.maxZ - bounds.minZ) + 1);
+		long area = (long) width * depth;
+		return area > Integer.MAX_VALUE ? Integer.MAX_VALUE : Math.max(1, (int) area);
+	}
+
 	public boolean isMember(UUID uuid) {
 		return ownerUuid.equals(uuid) || members.containsKey(uuid);
 	}
@@ -143,6 +150,10 @@ public final class GlowZone {
 
 	public long remainingActiveTicks() {
 		return remainingActiveTicks;
+	}
+
+	public long currentMaxDurationTicks(ServerWorld world, GlowFieldConfig config) {
+		return maxDurationTicks(world, config);
 	}
 
 	public int hostilePlayerDeathsRemaining() {
@@ -161,7 +172,6 @@ public final class GlowZone {
 		return switch (currentModeKey(world, config)) {
 			case "partial" -> "Spawn Prevention Mode";
 			case "force_field" -> "Force Field Mode";
-			case "degrading" -> "Degrading Mode";
 			case "hostile_force_field" -> "Hostile Force Field Mode";
 			default -> "Inactive Mode";
 		};
@@ -207,13 +217,15 @@ public final class GlowZone {
 		if (hostileToNonMembers && hostilePlayerDeathsRemaining <= 0) {
 			return ZoneState.INACTIVE;
 		}
-		if (interactionProgress >= config.degradingStateThreshold && minCharge > 0) {
-			return ZoneState.DEGRADING;
-		}
 		if (minCharge >= config.forceFieldMinCharge) {
 			return ZoneState.FORCE_FIELD;
 		}
 		return ZoneState.PARTIAL;
+	}
+
+	public boolean hasDegradationWarning(ServerWorld world, GlowFieldConfig config) {
+		ZoneState state = state(world, config);
+		return state != ZoneState.INACTIVE && (isNearingMobDegradation(config) || isNearingTimeDegradation(world, config));
 	}
 
 	public boolean contains(BlockPos pos) {
@@ -229,12 +241,66 @@ public final class GlowZone {
 	}
 
 	public boolean recordInteractionAndShouldDegrade(int interactionCount, GlowFieldConfig config) {
-		interactionProgress += interactionCount;
-		if (interactionProgress < config.degradeEveryMobInteractions) {
+		int degradeEvery = effectiveDegradeEveryMobInteractions(config);
+		if (interactionCount <= 0 || degradeEvery <= 0) {
 			return false;
 		}
-		interactionProgress -= config.degradeEveryMobInteractions;
+
+		interactionProgress += interactionCount;
+		if (interactionProgress < degradeEvery) {
+			return false;
+		}
+		interactionProgress -= degradeEvery;
 		return true;
+	}
+
+	public boolean isNearingMobDegradation(GlowFieldConfig config) {
+		int threshold = mobDegradationWarningThreshold(config);
+		return threshold > 0 && interactionProgress >= threshold;
+	}
+
+	public int mobDegradationWarningThreshold(GlowFieldConfig config) {
+		int degradeEvery = effectiveDegradeEveryMobInteractions(config);
+		if (degradeEvery <= 1) {
+			return -1;
+		}
+
+		int configuredThreshold = config.degradingStateThreshold;
+		if (configuredThreshold > 0 && configuredThreshold < config.degradeEveryMobInteractions) {
+			return scaleMobInteractionThreshold(configuredThreshold, config);
+		}
+		return Math.max(1, (degradeEvery * 4 + 4) / 5);
+	}
+
+	public int effectiveDegradeEveryMobInteractions(GlowFieldConfig config) {
+		return scaleMobInteractionThreshold(config.degradeEveryMobInteractions, config);
+	}
+
+	private int scaleMobInteractionThreshold(int baseThreshold, GlowFieldConfig config) {
+		if (baseThreshold <= 0) {
+			return -1;
+		}
+
+		int referenceArea = Math.max(1, config.mobInteractionNormalizationAreaBlocks);
+		double areaScale = Math.max(1.0, (double) horizontalAreaBlocks() / referenceArea);
+		return Math.max(1, (int) Math.ceil(baseThreshold * areaScale));
+	}
+
+	public boolean isNearingTimeDegradation(ServerWorld world, GlowFieldConfig config) {
+		long duration = maxDurationTicks(world, config);
+		long remaining = remainingActiveTicks;
+		return duration > 0
+			&& remaining > 0
+			&& minAnchorCharge(world) >= config.partialMinCharge
+			&& remaining <= timeDegradationWarningThreshold(duration);
+	}
+
+	public long timeDegradationWarningThreshold(ServerWorld world, GlowFieldConfig config) {
+		return timeDegradationWarningThreshold(maxDurationTicks(world, config));
+	}
+
+	private long timeDegradationWarningThreshold(long duration) {
+		return Math.max(1, (duration + 9) / 10);
 	}
 
 	public void resetProgress() {
